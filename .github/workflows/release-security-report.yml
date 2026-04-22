@@ -1,0 +1,290 @@
+name: Release Security Report
+
+on:
+  workflow_dispatch:
+    inputs:
+      git_ref:
+        description: Git ref to scan
+        required: true
+        default: main
+      scan_host:
+        description: SSH host for runtime scans (leave empty to skip runtime scans)
+        required: false
+        default: ""
+      scan_target:
+        description: Runtime scan target for nmap (IP or hostname reachable from scan host)
+        required: false
+        default: "127.0.0.1"
+      capture_duration:
+        description: Packet capture duration in seconds
+        required: false
+        default: "600"
+
+permissions:
+  contents: read
+
+jobs:
+  source_scans:
+    name: Source Scans
+    runs-on: ubuntu-latest
+    env:
+      SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL || 'https://sonar.infra.timecho.com:8443' }}
+      SONAR_PROJECT_KEY: ${{ vars.SONAR_PROJECT_KEY || 'Release:TimechoDB' }}
+      SONAR_PROJECT_NAME: ${{ vars.SONAR_PROJECT_NAME || 'Release:TimechoDB' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.git_ref }}
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
+
+      - name: Prepare artifact directories
+        run: mkdir -p artifacts/source
+
+      - name: Build packages
+        shell: bash
+        run: |
+          set +e
+          mvn -B -ntp clean package -DskipTests
+          echo "$?" > artifacts/source/build.exit
+
+      - name: Run OWASP Dependency-Check
+        shell: bash
+        env:
+          OSS_INDEX_USERNAME: ${{ secrets.OSS_INDEX_USERNAME }}
+          OSS_INDEX_PASSWORD: ${{ secrets.OSS_INDEX_PASSWORD }}
+        run: |
+          set +e
+          EXTRA_ARGS=()
+          if [[ -n "${OSS_INDEX_USERNAME}" && -n "${OSS_INDEX_PASSWORD}" ]]; then
+            EXTRA_ARGS+=("-DossIndexUsername=${OSS_INDEX_USERNAME}")
+            EXTRA_ARGS+=("-DossIndexPassword=${OSS_INDEX_PASSWORD}")
+          fi
+
+          mvn -B -ntp org.owasp:dependency-check-maven:aggregate \
+            -Dformat=JSON \
+            -Dformat=HTML \
+            -DskipTests \
+            -DfailBuildOnCVSS=11 \
+            "${EXTRA_ARGS[@]}"
+          echo "$?" > artifacts/source/dependency-check.exit
+
+          find . -path "*/target/dependency-check-report.json" -exec cp {} artifacts/source/dependency-check-report.json \; -quit
+          find . -path "*/target/dependency-check-report.html" -exec cp {} artifacts/source/dependency-check-report.html \; -quit
+
+      - name: Generate SBOM
+        shell: bash
+        run: |
+          set +e
+          mvn -B -ntp clean package -pl distribution -am -DskipTests -P enable-sbom-check
+          echo "$?" > artifacts/source/sbom.exit
+
+          find . -path "*/target/*.json" \
+            \( -iname "*bom*.json" -o -iname "*sbom*.json" -o -iname "dependency-check-report.json" \) \
+            -exec cp {} artifacts/source/ \;
+
+      - name: Run SonarQube analysis
+        if: ${{ secrets.SONAR_TOKEN != '' }}
+        shell: bash
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+          set +e
+          mvn -B -ntp clean verify sonar:sonar \
+            -Dsonar.projectKey="${SONAR_PROJECT_KEY}" \
+            -Dsonar.projectName="${SONAR_PROJECT_NAME}" \
+            -Dsonar.host.url="${SONAR_HOST_URL}" \
+            -Dsonar.token="${SONAR_TOKEN}" \
+            -DskipTests \
+            -pl '!example/jdbc,!example/mqtt,!example/mqtt-customize,!example/pipe-count-point-processor,!example/pipe-opc-ua-sink,!example/rest-java-example,!example/schema,!example/session,!example/trigger,!example/udf,!library-udf' \
+            -am
+          echo "$?" > artifacts/source/sonar.exit
+
+      - name: Query SonarQube summary
+        if: ${{ secrets.SONAR_TOKEN != '' }}
+        shell: bash
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+          set +e
+          curl -sS -u "${SONAR_TOKEN}:" \
+            "${SONAR_HOST_URL}/api/measures/component?component=${SONAR_PROJECT_KEY}&metricKeys=alert_status,vulnerabilities,bugs,code_smells,reliability_rating,security_rating" \
+            > artifacts/source/sonar-summary.json
+          echo "$?" > artifacts/source/sonar-query.exit
+
+      - name: Note skipped SonarQube analysis
+        if: ${{ secrets.SONAR_TOKEN == '' }}
+        run: echo "skipped" > artifacts/source/sonar.exit
+
+      - name: Upload source scan artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: source-scan-artifacts
+          path: artifacts/source
+          if-no-files-found: warn
+
+  runtime_scans:
+    name: Runtime Scans
+    if: ${{ inputs.scan_host != '' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.git_ref }}
+
+      - name: Install analysis tools
+        shell: bash
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          sudo apt-get update
+          sudo apt-get install -y tshark openssh-client
+
+      - name: Prepare SSH
+        shell: bash
+        env:
+          RUNTIME_SCAN_SSH_KEY: ${{ secrets.RUNTIME_SCAN_SSH_KEY }}
+          RUNTIME_SCAN_KNOWN_HOSTS: ${{ secrets.RUNTIME_SCAN_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh artifacts/runtime
+          printf '%s\n' "${RUNTIME_SCAN_SSH_KEY}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          if [[ -n "${RUNTIME_SCAN_KNOWN_HOSTS}" ]]; then
+            printf '%s\n' "${RUNTIME_SCAN_KNOWN_HOSTS}" > ~/.ssh/known_hosts
+          else
+            ssh-keyscan -H "${{ inputs.scan_host }}" >> ~/.ssh/known_hosts
+          fi
+
+      - name: Run remote nmap and packet capture
+        shell: bash
+        env:
+          RUNTIME_SCAN_SSH_USER: ${{ secrets.RUNTIME_SCAN_SSH_USER }}
+        run: |
+          set +e
+          REMOTE_DIR="/tmp/security-scan-${GITHUB_RUN_ID}"
+          export REMOTE_DIR
+
+          ssh "${RUNTIME_SCAN_SSH_USER}@${{ inputs.scan_host }}" "bash -s -- '${REMOTE_DIR}' '${{ inputs.scan_target }}' '${{ inputs.capture_duration }}'" <<'EOF'
+          set -euo pipefail
+          REMOTE_DIR="$1"
+          SCAN_TARGET="$2"
+          CAPTURE_DURATION="$3"
+
+          mkdir -p "${REMOTE_DIR}"
+          hostname -I | awk '{print $1}' > "${REMOTE_DIR}/host_ip.txt" || hostname > "${REMOTE_DIR}/host_ip.txt"
+
+          timeout "${CAPTURE_DURATION}" sudo tcpdump -i any -nn -w "${REMOTE_DIR}/runtime_capture.pcap" >/dev/null 2>&1 &
+          TCPDUMP_PID=$!
+          sleep 5
+          sudo nmap -sV -T4 -p- "${SCAN_TARGET}" -oN "${REMOTE_DIR}/nmap.txt"
+          wait "${TCPDUMP_PID}" || true
+          EOF
+
+          SSH_EXIT_CODE="$?"
+          echo "${SSH_EXIT_CODE}" > artifacts/runtime/runtime-remote.exit
+
+          scp "${RUNTIME_SCAN_SSH_USER}@${{ inputs.scan_host }}:${REMOTE_DIR}/nmap.txt" artifacts/runtime/nmap.txt
+          scp "${RUNTIME_SCAN_SSH_USER}@${{ inputs.scan_host }}:${REMOTE_DIR}/runtime_capture.pcap" artifacts/runtime/runtime_capture.pcap
+          scp "${RUNTIME_SCAN_SSH_USER}@${{ inputs.scan_host }}:${REMOTE_DIR}/host_ip.txt" artifacts/runtime/host_ip.txt
+          exit 0
+
+      - name: Compare ports with whitelist
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          if [[ -f artifacts/runtime/nmap.txt ]]; then
+            python security-automation/scripts/check_ports.py \
+              --nmap artifacts/runtime/nmap.txt \
+              --allowed security-automation/config/allowed-ports.txt \
+              --output artifacts/runtime/port-summary.json
+          fi
+
+      - name: Extract network flows
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          if [[ -f artifacts/runtime/runtime_capture.pcap ]]; then
+            tshark -r artifacts/runtime/runtime_capture.pcap \
+              -T fields \
+              -E header=y \
+              -E separator=, \
+              -e ip.src \
+              -e ip.dst \
+              -e tcp.dstport \
+              -e udp.dstport \
+              > artifacts/runtime/flows.csv || true
+          fi
+
+      - name: Summarize packet capture
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          if [[ -f artifacts/runtime/host_ip.txt && -f artifacts/runtime/flows.csv ]]; then
+            python security-automation/scripts/summarize_endpoints.py \
+              --host-ip-file artifacts/runtime/host_ip.txt \
+              --flows-file artifacts/runtime/flows.csv \
+              --output artifacts/runtime/pcap-summary.json
+          fi
+
+      - name: Upload runtime scan artifacts
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-scan-artifacts
+          path: artifacts/runtime
+          if-no-files-found: warn
+
+  report:
+    name: Assemble Report
+    if: ${{ always() }}
+    needs:
+      - source_scans
+      - runtime_scans
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.git_ref }}
+
+      - name: Download source artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: source-scan-artifacts
+          path: artifacts/source
+
+      - name: Download runtime artifacts
+        if: ${{ inputs.scan_host != '' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: runtime-scan-artifacts
+          path: artifacts/runtime
+
+      - name: Render markdown report
+        shell: bash
+        run: |
+          mkdir -p artifacts/final
+          python security-automation/scripts/render_report.py \
+            --git-ref "${{ inputs.git_ref }}" \
+            --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --source-dir artifacts/source \
+            --runtime-dir artifacts/runtime \
+            --output artifacts/final/release-security-report.md
+
+      - name: Publish job summary
+        shell: bash
+        run: cat artifacts/final/release-security-report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload final report
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-security-report
+          path: artifacts/final/release-security-report.md
+          if-no-files-found: error
