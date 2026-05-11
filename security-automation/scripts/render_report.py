@@ -71,13 +71,62 @@ def sonar_section(source_dir: Path) -> list[str]:
 
 def sbom_section(source_dir: Path) -> list[str]:
     exit_code = read_exit_code(source_dir / "sbom.exit")
-    json_files = sorted(path.name for path in source_dir.glob("*.json") if "dependency-check" not in path.name)
+    json_files = sorted(
+        path.name
+        for path in source_dir.glob("*.json")
+        if "dependency-check" not in path.name
+        and ("bom" in path.name.lower() or "sbom" in path.name.lower())
+    )
     lines = ["## SBOM", f"- Exit code: `{exit_code}`"]
     if not json_files:
         lines.append("- No SBOM file was found in the artifacts.")
     else:
         lines.append(f"- Generated files: `{', '.join(json_files)}`")
-    lines.append("- If Dependency-Track is unavailable, keep the SBOM artifacts and upload them later.")
+    return lines
+
+
+def dependency_track_section(source_dir: Path) -> list[str]:
+    exit_code = read_exit_code(source_dir / "dependency-track.exit")
+    summary = read_json(source_dir / "dependency-track-summary.json")
+    lines = ["## Dependency-Track", f"- Exit code: `{exit_code}`"]
+    if exit_code == "skipped":
+        lines.append("- Dependency-Track upload was skipped because credentials were not configured.")
+        return lines
+    if exit_code == "missing":
+        lines.append("- No SBOM file was available for upload.")
+        return lines
+    if not summary:
+        lines.append("- No parseable Dependency-Track summary was generated.")
+        return lines
+
+    project = summary.get("project", {})
+    metrics = summary.get("metrics") or {}
+    sbom = summary.get("sbom") or {}
+    lines.append(
+        f"- Project: `{project.get('name', 'unknown')}@{project.get('version', 'unknown')}`"
+    )
+    if project.get("uuid"):
+        lines.append(f"- Project UUID: `{project['uuid']}`")
+    if "created" in project:
+        lines.append(f"- Project created during run: `{project['created']}`")
+    if sbom.get("upload_token"):
+        lines.append(f"- Upload token: `{sbom['upload_token']}`")
+    if "processing_complete" in sbom:
+        lines.append(f"- Processing complete: `{sbom['processing_complete']}`")
+    if "elapsed_seconds" in sbom:
+        lines.append(f"- Processing wait time: `{sbom['elapsed_seconds']}` seconds")
+    if metrics:
+        lines.extend(
+            [
+                f"- Components: `{metrics.get('components', 'unknown')}`",
+                f"- Vulnerabilities: `{metrics.get('vulnerabilities', 'unknown')}`",
+                f"- Findings total: `{metrics.get('findingsTotal', 'unknown')}`",
+                f"- Policy violations total: `{metrics.get('policyViolationsTotal', 'unknown')}`",
+            ]
+        )
+    errors = summary.get("errors") or []
+    if errors:
+        lines.append(f"- Errors: `{' | '.join(errors)}`")
     return lines
 
 
@@ -145,6 +194,8 @@ def main() -> None:
     lines.append("")
     lines.extend(sbom_section(source_dir))
     lines.append("")
+    lines.extend(dependency_track_section(source_dir))
+    lines.append("")
     lines.extend(runtime_section(runtime_dir))
     lines.append("")
     lines.extend(
@@ -152,11 +203,13 @@ def main() -> None:
             "## Follow-up",
             "- Review OWASP and Sonar findings manually and confirm false positives.",
             "- Review public outbound endpoints together with other processes running on the test host.",
-            "- Add automatic Dependency-Track upload and result retrieval after the platform is available again.",
+            "- Review Dependency-Track findings and tune project naming/versioning if uploads target the wrong project.",
         ]
     )
 
-    Path(args.output).write_text("\n".join(lines) + "\n", encoding="utf-8")
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 if __name__ == "__main__":

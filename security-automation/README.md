@@ -1,57 +1,83 @@
 # Security Automation Template
 
-这套模板面向发版前的自动化安全报告，包含四块内容：
+This template builds a pre-release security report with these stages:
 
-- `SonarQube` 源码扫描
-- `OWASP Dependency-Check` 依赖漏洞扫描
-- `SBOM` 生成
-- 部署后 `nmap` 端口扫描与 `tcpdump/tshark` 抓包摘要
+- `SonarQube` source analysis
+- `OWASP Dependency-Check` dependency analysis
+- `SBOM` generation
+- `Dependency-Track` project lookup/create and SBOM upload
+- post-deploy `nmap` port scan and `tcpdump/tshark` packet summary
 
-## 工作流入口
-
-工作流文件位于：
+## Workflow
 
 - `.github/workflows/release-security-report.yml`
 
-默认使用 `workflow_dispatch` 手动触发，比较适合“RC 包部署完成后，发版前出一份安全报告”的场景。
+The workflow is triggered manually with `workflow_dispatch`. It is intended for release-candidate validation before a release decision.
 
-## 需要配置的 GitHub Secrets
+## Required GitHub Secrets
 
 - `SONAR_TOKEN`
 - `OSS_INDEX_USERNAME`
 - `OSS_INDEX_PASSWORD`
+- `DEPENDENCY_TRACK_USERNAME`
+- `DEPENDENCY_TRACK_PASSWORD`
 - `RUNTIME_SCAN_SSH_USER`
 - `RUNTIME_SCAN_SSH_KEY`
-- `RUNTIME_SCAN_KNOWN_HOSTS` 可选
+- `RUNTIME_SCAN_KNOWN_HOSTS` optional
 
-## 建议配置的 GitHub Variables
+## Recommended GitHub Variables
 
 - `SONAR_HOST_URL`
 - `SONAR_PROJECT_KEY`
 - `SONAR_PROJECT_NAME`
+- `DEPENDENCY_TRACK_BASE_URL`
+- `DEPENDENCY_TRACK_PROJECT_NAME`
+- `DEPENDENCY_TRACK_PROJECT_VERSION`
+- `DEPENDENCY_TRACK_PROJECT_CLASSIFIER`
+- `DEPENDENCY_TRACK_CREATE_PROJECT`
+- `DEPENDENCY_TRACK_PROJECT_IS_LATEST`
 
-## 远端测试环境前置条件
+## Dependency-Track Notes
 
-- 目标机已部署并启动待测版本
-- 目标机已安装 `nmap`
-- 目标机已安装 `tcpdump`
-- SSH 用户具备运行 `sudo nmap` 和 `sudo tcpdump` 的权限
+The current server expects:
 
-## 当前白名单
+- UI host: `https://sbom.infra.timecho.com`
+- API host: `https://sbom-api.infra.timecho.com`
+- login endpoint: `POST /api/v1/user/login`
+- login content type: `application/x-www-form-urlencoded`
 
-配置文件：
+The helper script is:
+
+- `security-automation/scripts/dependency_track.py`
+
+It can:
+
+- log in and obtain a bearer token
+- look up a project by exact name and version
+- create the project when enabled
+- upload a generated SBOM
+- poll asynchronous processing status
+- fetch project metrics for the report
+
+## Runtime Scan Prerequisites
+
+- the target host is deployed and running the candidate build
+- `nmap` is installed on the target host
+- `tcpdump` is installed on the target host
+- the SSH user can execute `sudo nmap` and `sudo tcpdump`
+
+## Port Whitelist
 
 - `security-automation/config/allowed-ports.txt`
 
-默认端口白名单为：
+Default whitelist:
 
 - `6667`
 - `9091`
 - `9092`
 - `10710-10760`
 
-## 当前实现边界
+## Current Limits
 
-- `Dependency-Track` 目前按“先生成 SBOM，等平台恢复后再补自动上传”处理
-- 抓包摘要基于主机级流量，若测试机上混跑其他服务，需要人工排除误报
-- 默认只生成报告，不阻断发版
+- packet summaries are host-level and may include traffic from other processes on the same machine
+- the workflow is report-only by default and does not block releases

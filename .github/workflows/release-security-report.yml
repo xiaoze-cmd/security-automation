@@ -31,6 +31,12 @@ jobs:
       SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL || 'https://sonar.infra.timecho.com:8443' }}
       SONAR_PROJECT_KEY: ${{ vars.SONAR_PROJECT_KEY || 'Release:TimechoDB' }}
       SONAR_PROJECT_NAME: ${{ vars.SONAR_PROJECT_NAME || 'Release:TimechoDB' }}
+      DEPENDENCY_TRACK_BASE_URL: ${{ vars.DEPENDENCY_TRACK_BASE_URL || 'https://sbom-api.infra.timecho.com' }}
+      DEPENDENCY_TRACK_PROJECT_NAME: ${{ vars.DEPENDENCY_TRACK_PROJECT_NAME || github.event.repository.name }}
+      DEPENDENCY_TRACK_PROJECT_VERSION: ${{ vars.DEPENDENCY_TRACK_PROJECT_VERSION || inputs.git_ref }}
+      DEPENDENCY_TRACK_PROJECT_CLASSIFIER: ${{ vars.DEPENDENCY_TRACK_PROJECT_CLASSIFIER || 'APPLICATION' }}
+      DEPENDENCY_TRACK_CREATE_PROJECT: ${{ vars.DEPENDENCY_TRACK_CREATE_PROJECT || 'true' }}
+      DEPENDENCY_TRACK_PROJECT_IS_LATEST: ${{ vars.DEPENDENCY_TRACK_PROJECT_IS_LATEST || 'false' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -88,6 +94,43 @@ jobs:
           find . -path "*/target/*.json" \
             \( -iname "*bom*.json" -o -iname "*sbom*.json" -o -iname "dependency-check-report.json" \) \
             -exec cp {} artifacts/source/ \;
+
+      - name: Upload SBOM to Dependency-Track
+        if: ${{ secrets.DEPENDENCY_TRACK_USERNAME != '' && secrets.DEPENDENCY_TRACK_PASSWORD != '' }}
+        shell: bash
+        env:
+          DEPENDENCY_TRACK_USERNAME: ${{ secrets.DEPENDENCY_TRACK_USERNAME }}
+          DEPENDENCY_TRACK_PASSWORD: ${{ secrets.DEPENDENCY_TRACK_PASSWORD }}
+        run: |
+          set +e
+          SBOM_PATH="$(find artifacts/source -maxdepth 1 -type f \( -iname '*bom*.json' -o -iname '*sbom*.json' \) ! -iname 'dependency-check-report.json' | head -n 1)"
+          if [[ -z "${SBOM_PATH}" ]]; then
+            echo "missing" > artifacts/source/dependency-track.exit
+          else
+            EXTRA_ARGS=()
+            if [[ "${DEPENDENCY_TRACK_CREATE_PROJECT,,}" == "true" ]]; then
+              EXTRA_ARGS+=(--create-project)
+            fi
+            if [[ "${DEPENDENCY_TRACK_PROJECT_IS_LATEST,,}" == "true" ]]; then
+              EXTRA_ARGS+=(--project-is-latest)
+            fi
+
+            python security-automation/scripts/dependency_track.py \
+              --base-url "${DEPENDENCY_TRACK_BASE_URL}" \
+              --username "${DEPENDENCY_TRACK_USERNAME}" \
+              --password "${DEPENDENCY_TRACK_PASSWORD}" \
+              --project-name "${DEPENDENCY_TRACK_PROJECT_NAME}" \
+              --project-version "${DEPENDENCY_TRACK_PROJECT_VERSION}" \
+              --project-classifier "${DEPENDENCY_TRACK_PROJECT_CLASSIFIER}" \
+              --sbom-path "${SBOM_PATH}" \
+              --output artifacts/source/dependency-track-summary.json \
+              "${EXTRA_ARGS[@]}"
+            echo "$?" > artifacts/source/dependency-track.exit
+          fi
+
+      - name: Note skipped Dependency-Track upload
+        if: ${{ secrets.DEPENDENCY_TRACK_USERNAME == '' || secrets.DEPENDENCY_TRACK_PASSWORD == '' }}
+        run: echo "skipped" > artifacts/source/dependency-track.exit
 
       - name: Run SonarQube analysis
         if: ${{ secrets.SONAR_TOKEN != '' }}
